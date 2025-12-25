@@ -5,6 +5,7 @@ import base64
 import json
 import csv
 import gc
+import os
 from collections import Counter
 import pandas as pd
 import matplotlib
@@ -18,6 +19,7 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from flask_socketio import SocketIO, emit
 
 mpl.rcParams.update({
     "axes.titlesize": 9,
@@ -28,6 +30,14 @@ mpl.rcParams.update({
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+app.config['SECRET_KEY'] = 'datasmith-secret-key-2025'
+
+# Initialize SocketIO for real-time communication
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# Initialize live monitor
+from live_monitor import init_live_monitor, live_monitor
+monitor = init_live_monitor(socketio)
 
 # ---------------- REGEX PATTERNS ----------------
 
@@ -270,14 +280,32 @@ def index():
     return render_template('index.html')
 
 
+# Global progress tracking for current analysis
+analysis_progress = {
+    'lines_processed': 0,
+    'threats_found': 0,
+    'current_stage': 'idle',
+    'progress_percent': 0
+}
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
+    global analysis_progress
+    
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
+    
+    # Reset progress
+    analysis_progress = {
+        'lines_processed': 0,
+        'threats_found': 0,
+        'current_stage': 'parsing',
+        'progress_percent': 0
+    }
     
     # ---------------- STATS & COUNTERS ----------------
     stats = {
@@ -294,7 +322,7 @@ def analyze():
     
     # ---------------- CONFIGURATION FOR LARGE FILES ----------------
     MAX_LOG_ENTRIES = 10000  # Limit stored entries to prevent memory overflow
-    BATCH_SIZE = 50000  # Process in batches for progress tracking
+    PROGRESS_UPDATE_INTERVAL = 5000  # Emit progress every N lines
     
     # ---------------- STREAMING LINE-BY-LINE PARSING ----------------
     # Read file in streaming mode to handle large files efficiently
@@ -309,6 +337,15 @@ def analyze():
             continue
         
         stats["total"] += 1
+        
+        # Emit progress updates via WebSocket for real-time UI updates
+        if stats["total"] % PROGRESS_UPDATE_INTERVAL == 0:
+            analysis_progress['lines_processed'] = stats["total"]
+            analysis_progress['threats_found'] = sum(stats["attack_types"].values())
+            try:
+                socketio.emit('analysis_progress', analysis_progress, namespace='/live')
+            except:
+                pass  # Don't fail if no clients connected
         
         # Garbage collection every 100K lines to free memory
         if stats["total"] % 100000 == 0:
@@ -823,6 +860,12 @@ def analyze():
     charts['log_types'] = create_chart(df_logtypes, 'vertical_bar', 'Log Types')
     
     # ---------------- PREPARE RESPONSE ----------------
+    # Final progress update
+    analysis_progress['lines_processed'] = stats['total']
+    analysis_progress['threats_found'] = sum(stats['attack_types'].values())
+    analysis_progress['current_stage'] = 'complete'
+    analysis_progress['progress_percent'] = 100
+    
     response = {
         'metrics': {
             'total': stats['total'],
@@ -840,6 +883,13 @@ def analyze():
     }
     
     return jsonify(response)
+
+
+@app.route('/analysis-progress', methods=['GET'])
+def get_analysis_progress():
+    """Get real-time analysis progress for the pipeline UI"""
+    global analysis_progress
+    return jsonify(analysis_progress)
 
 
 # ---------------- HISTORY ENDPOINTS ----------------
@@ -979,6 +1029,762 @@ def export_json():
         as_attachment=True,
         download_name=f'DataSmith_Logs_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
     )
+
+
+# ================== ATTACK-WISE REPORT GENERATION ==================
+
+def create_attack_chart(attack_data, title, chart_type='bar'):
+    """Create a chart for specific attack data"""
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+    
+    fig, ax = plt.subplots(figsize=(5, 3.5))
+    
+    if not attack_data:
+        ax.text(0.5, 0.5, 'No Data', ha='center', va='center', fontsize=14, color='gray')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+    else:
+        labels = list(attack_data.keys())[:10]
+        values = list(attack_data.values())[:10]
+        
+        # Color gradient based on severity
+        colors_list = ['#ff4757', '#ffa502', '#ffdd59', '#70a1ff', '#2ed573']
+        n_bars = len(labels)
+        bar_colors = [colors_list[i % len(colors_list)] for i in range(n_bars)]
+        
+        if chart_type == 'horizontal_bar':
+            ax.barh(labels, values, color=bar_colors, height=0.6)
+            ax.set_xlabel('Count', color='#333')
+        elif chart_type == 'pie':
+            ax.pie(values, labels=labels, autopct='%1.1f%%', colors=bar_colors, startangle=90)
+        else:
+            ax.bar(labels, values, color=bar_colors, width=0.6)
+            ax.set_ylabel('Count', color='#333')
+            plt.xticks(rotation=45, ha='right')
+    
+    ax.set_title(title, fontsize=12, fontweight='bold', color='#0a192f')
+    
+    for spine in ax.spines.values():
+        spine.set_color('#ccc')
+    
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('#fafafa')
+    plt.tight_layout()
+    
+    # Convert to base64
+    img = io.BytesIO()
+    plt.savefig(img, format='png', dpi=120, bbox_inches='tight')
+    img.seek(0)
+    plt.close(fig)
+    
+    return base64.b64encode(img.getvalue()).decode()
+
+
+@app.route('/generate-attack-report', methods=['POST'])
+def generate_attack_report():
+    """Generate a PDF report filtered by selected attack types"""
+    data = request.json
+    
+    # Get selections
+    selected_attacks = data.get('selected_attacks', [])  # List of attack types to include
+    metrics = data.get('metrics', {})
+    attack_types = data.get('attack_types', {})
+    top_ips = data.get('top_ips', {})
+    log_data = data.get('log_data', [])
+    include_charts = data.get('include_charts', True)
+    include_details = data.get('include_details', True)
+    
+    if not selected_attacks:
+        return jsonify({'error': 'No attack types selected'}), 400
+    
+    # Filter data by selected attacks
+    filtered_attacks = {k: v for k, v in attack_types.items() if k in selected_attacks}
+    filtered_logs = [log for log in log_data if log.get('attack_type') in selected_attacks]
+    
+    # Get IPs involved in selected attacks
+    attack_ips = Counter()
+    for log in filtered_logs:
+        ip = log.get('ip')
+        if ip and ip != 'Unknown':
+            attack_ips[ip] += 1
+    
+    # Create PDF buffer
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=letter,
+        topMargin=0.5*inch, bottomMargin=0.5*inch,
+        leftMargin=0.6*inch, rightMargin=0.6*inch
+    )
+    
+    # Professional Color palette
+    CYBER_GREEN = colors.HexColor('#00ff41')
+    DARK_NAVY = colors.HexColor('#0a192f')
+    SLATE = colors.HexColor('#8892b0')
+    CRITICAL_RED = colors.HexColor('#ff4757')
+    HIGH_ORANGE = colors.HexColor('#ffa502')
+    MEDIUM_YELLOW = colors.HexColor('#ffdd59')
+    LOW_BLUE = colors.HexColor('#70a1ff')
+    SECURE_GREEN = colors.HexColor('#2ed573')
+    WHITE = colors.white
+    
+    # Attack severity configuration
+    SEVERITY_CONFIG = {
+        'SQL Injection': (CRITICAL_RED, 'CRITICAL', 5),
+        'Remote Code Execution': (CRITICAL_RED, 'CRITICAL', 5),
+        'LFI / Path Traversal': (CRITICAL_RED, 'CRITICAL', 5),
+        'XSS Attempt': (HIGH_ORANGE, 'HIGH', 4),
+        'Database Attack': (HIGH_ORANGE, 'HIGH', 4),
+        'WAF Block': (HIGH_ORANGE, 'HIGH', 4),
+        'Cloud Security Event': (HIGH_ORANGE, 'HIGH', 4),
+        'SSH Brute Force': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'Auth Brute Force': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'FTP Brute Force': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'SMTP Attack': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'Windows Auth Failure': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'VPN Auth Failure': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'Sensitive File Scan': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'Suspicious DNS Query': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'Container Error': (MEDIUM_YELLOW, 'MEDIUM', 3),
+        'Automated Scanner': (LOW_BLUE, 'LOW', 2),
+        'Blocked Connection': (LOW_BLUE, 'LOW', 2),
+        'Server Error': (LOW_BLUE, 'LOW', 2),
+        'Probe / Scan': (LOW_BLUE, 'LOW', 2),
+    }
+    
+    styles = getSampleStyleSheet()
+    
+    def create_style(name, **kwargs):
+        return ParagraphStyle(name, parent=styles['Normal'], **kwargs)
+    
+    # Professional Custom styles
+    title_main = create_style('TitleMain',
+        fontSize=32, textColor=DARK_NAVY, alignment=TA_CENTER,
+        fontName='Helvetica-Bold', spaceAfter=15, spaceBefore=10)
+    
+    subtitle = create_style('Subtitle',
+        fontSize=14, textColor=CYBER_GREEN, alignment=TA_CENTER,
+        fontName='Helvetica', spaceAfter=25, spaceBefore=5)
+    
+    section_title = create_style('SectionTitle',
+        fontSize=18, textColor=CYBER_GREEN, fontName='Helvetica-Bold',
+        spaceAfter=15, spaceBefore=20, leftIndent=0)
+    
+    body = create_style('Body',
+        fontSize=11, textColor=colors.black, fontName='Helvetica',
+        spaceAfter=8, leading=16)
+    
+    small_text = create_style('SmallText',
+        fontSize=9, textColor=SLATE, fontName='Helvetica',
+        alignment=TA_CENTER, spaceAfter=5)
+    
+    story = []
+    
+    # ═══════════════════════════════════════════════════════════════
+    # COVER PAGE - Professional Design
+    # ═══════════════════════════════════════════════════════════════
+    story.append(Spacer(1, 0.8*inch))
+    
+    # Professional header box with shield icon
+    header_box = Table(
+        [['[ SECURITY REPORT ]']],
+        colWidths=[6.5*inch]
+    )
+    header_box.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 14),
+        ('TEXTCOLOR', (0, 0), (-1, -1), CYBER_GREEN),
+        ('BACKGROUND', (0, 0), (-1, -1), DARK_NAVY),
+        ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+    ]))
+    story.append(header_box)
+    
+    story.append(Spacer(1, 0.5*inch))
+    
+    # Main title
+    story.append(Paragraph("ATTACK ANALYSIS", title_main))
+    story.append(Spacer(1, 0.1*inch))
+    story.append(Paragraph("Security Intelligence Report", subtitle))
+    
+    story.append(Spacer(1, 0.4*inch))
+    
+    # Cover metrics box - Professional styling
+    total_threats = sum(filtered_attacks.values())
+    unique_ips = len(attack_ips)
+    attack_count = len(selected_attacks)
+    
+    cover_data = [
+        [f'{total_threats:,}', f'{attack_count}', f'{unique_ips:,}'],
+        ['Threats Found', 'Attack Types', 'Attacker IPs']
+    ]
+    
+    cover_table = Table(cover_data, colWidths=[2.2*inch, 2.2*inch, 2.2*inch])
+    cover_table.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 32),
+        ('FONTSIZE', (0, 1), (-1, 1), 10),
+        ('TEXTCOLOR', (0, 0), (0, 0), CRITICAL_RED),
+        ('TEXTCOLOR', (1, 0), (1, 0), CYBER_GREEN),
+        ('TEXTCOLOR', (2, 0), (2, 0), LOW_BLUE),
+        ('TEXTCOLOR', (0, 1), (-1, 1), SLATE),
+        ('TOPPADDING', (0, 0), (-1, -1), 15),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 15),
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
+        ('BOX', (0, 0), (-1, -1), 2, colors.HexColor('#e9ecef')),
+    ]))
+    story.append(cover_table)
+    
+    story.append(Spacer(1, 0.5*inch))
+    
+    # Threat Level Indicator based on severity
+    critical_count = sum(v for k, v in filtered_attacks.items() if SEVERITY_CONFIG.get(k, (SLATE, 'INFO', 1))[1] == 'CRITICAL')
+    high_count = sum(v for k, v in filtered_attacks.items() if SEVERITY_CONFIG.get(k, (SLATE, 'INFO', 1))[1] == 'HIGH')
+    
+    if critical_count > 0:
+        level, level_color, level_desc = 'CRITICAL', CRITICAL_RED, 'Immediate action required - Critical threats detected'
+    elif high_count > 0:
+        level, level_color, level_desc = 'HIGH', HIGH_ORANGE, 'Urgent attention needed - High severity threats'
+    elif total_threats > 10:
+        level, level_color, level_desc = 'MEDIUM', MEDIUM_YELLOW, 'Review recommended - Multiple threats detected'
+    elif total_threats > 0:
+        level, level_color, level_desc = 'LOW', LOW_BLUE, 'Monitor situation - Minor threats detected'
+    else:
+        level, level_color, level_desc = 'SECURE', SECURE_GREEN, 'No threats detected'
+    
+    threat_box = Table(
+        [[f'THREAT LEVEL: {level}'], [level_desc]],
+        colWidths=[6.2*inch]
+    )
+    threat_box.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (0, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (0, 0), 22),
+        ('FONTSIZE', (0, 1), (0, 1), 11),
+        ('TEXTCOLOR', (0, 0), (0, 0), level_color),
+        ('TEXTCOLOR', (0, 1), (0, 1), SLATE),
+        ('TOPPADDING', (0, 0), (-1, -1), 18),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 18),
+        ('BOX', (0, 0), (-1, -1), 3, level_color),
+    ]))
+    story.append(threat_box)
+    
+    story.append(Spacer(1, 0.5*inch))
+    
+    # Report metadata
+    report_id = datetime.now().strftime('%Y%m%d-%H%M%S')
+    report_date = datetime.now().strftime('%B %d, %Y • %I:%M %p')
+    
+    meta_text = f"""<para alignment="center">
+    <font color="#666666" size="10">
+    Report ID: <b>ATK-{report_id}</b><br/>
+    Generated: {report_date}<br/>
+    Classification: <font color="#ff4757"><b>CONFIDENTIAL</b></font>
+    </font>
+    </para>"""
+    story.append(Paragraph(meta_text, body))
+    
+    story.append(PageBreak())
+    
+    # ═══════════════════════════════════════════════════════════════
+    # EXECUTIVE SUMMARY
+    # ═══════════════════════════════════════════════════════════════
+    story.append(Paragraph("[+] EXECUTIVE SUMMARY", section_title))
+    
+    # Summary paragraph
+    summary = f"""This focused attack analysis report examines <b>{len(selected_attacks)}</b> specific attack types 
+    selected for review. The analysis identified <b>{total_threats:,}</b> threat instances 
+    originating from <b>{unique_ips:,}</b> unique IP addresses. 
+    This report provides detailed breakdown and actionable recommendations."""
+    story.append(Paragraph(summary, body))
+    story.append(Spacer(1, 0.2*inch))
+    
+    # Selected attacks list
+    attacks_text = ", ".join(selected_attacks)
+    story.append(Paragraph(f"<b>Selected Attack Types:</b> {attacks_text}", body))
+    story.append(Spacer(1, 0.3*inch))
+    
+    # ═══════════════════════════════════════════════════════════════
+    # ATTACK METRICS TABLE - Professional styling
+    # ═══════════════════════════════════════════════════════════════
+    story.append(Paragraph("[!] THREAT OVERVIEW", section_title))
+    
+    # Attack types table with severity
+    attack_rows = [['Attack Type', 'Count', 'Severity', 'Priority']]
+    sorted_attacks = sorted(filtered_attacks.items(), key=lambda x: x[1], reverse=True)
+    
+    for attack, count in sorted_attacks:
+        color, sev, pri = SEVERITY_CONFIG.get(attack, (SLATE, 'INFO', 1))
+        attack_rows.append([attack, f'{count:,}', sev, '●' * pri])
+    
+    attack_tbl = Table(attack_rows, colWidths=[2.8*inch, 1*inch, 1.2*inch, 1.2*inch])
+    
+    tbl_style = [
+        ('BACKGROUND', (0, 0), (-1, 0), DARK_NAVY),
+        ('TEXTCOLOR', (0, 0), (-1, 0), CYBER_GREEN),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 11),
+        ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+        ('FONTSIZE', (0, 1), (-1, -1), 10),
+        ('ALIGN', (1, 1), (-1, -1), 'CENTER'),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#dee2e6')),
+        ('LINEBELOW', (0, 0), (-1, 0), 2, CYBER_GREEN),
+        ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+        ('LEFTPADDING', (0, 0), (-1, -1), 12),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 12),
+    ]
+    
+    # Color-code rows by severity
+    for i, (attack, _) in enumerate(sorted_attacks, 1):
+        color, sev, _ = SEVERITY_CONFIG.get(attack, (SLATE, 'INFO', 1))
+        if sev == 'CRITICAL':
+            bg = colors.HexColor('#ffe8e8')
+        elif sev == 'HIGH':
+            bg = colors.HexColor('#fff3e0')
+        elif sev == 'MEDIUM':
+            bg = colors.HexColor('#fffde7')
+        else:
+            bg = colors.HexColor('#e3f2fd')
+        tbl_style.append(('BACKGROUND', (0, i), (-1, i), bg))
+        tbl_style.append(('TEXTCOLOR', (3, i), (3, i), color))
+        tbl_style.append(('TEXTCOLOR', (2, i), (2, i), color))
+    
+    attack_tbl.setStyle(TableStyle(tbl_style))
+    story.append(attack_tbl)
+    story.append(Spacer(1, 0.4*inch))
+    
+    # ═══════════════════════════════════════════════════════════════
+    # TOP ATTACKER IPs TABLE - Professional styling
+    # ═══════════════════════════════════════════════════════════════
+    if attack_ips:
+        story.append(Paragraph("[>] TOP ATTACKER IPs", section_title))
+        
+        ip_rows = [['#', 'IP Address', 'Requests', 'Threat Level']]
+        sorted_ips = attack_ips.most_common(10)
+        max_req = max([c for _, c in sorted_ips]) if sorted_ips else 1
+        
+        for i, (ip, count) in enumerate(sorted_ips, 1):
+            pct = (count / max_req) * 100
+            if pct >= 80:
+                bar = '██████████'
+                ip_color = CRITICAL_RED
+            elif pct >= 60:
+                bar = '████████░░'
+                ip_color = HIGH_ORANGE
+            elif pct >= 40:
+                bar = '██████░░░░'
+                ip_color = MEDIUM_YELLOW
+            else:
+                bar = '████░░░░░░'
+                ip_color = LOW_BLUE
+            ip_rows.append([str(i), ip, f'{count:,}', bar])
+        
+        ip_tbl = Table(ip_rows, colWidths=[0.5*inch, 2.5*inch, 1.2*inch, 2*inch])
+        
+        ip_style = [
+            ('BACKGROUND', (0, 0), (-1, 0), DARK_NAVY),
+            ('TEXTCOLOR', (0, 0), (-1, 0), CYBER_GREEN),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 11),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('FONTNAME', (0, 1), (0, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (1, 1), (-1, -1), 'Courier'),
+            ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ('ALIGN', (0, 1), (0, -1), 'CENTER'),
+            ('ALIGN', (2, 1), (2, -1), 'RIGHT'),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, colors.HexColor('#f8f9fa')]),
+            ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#dee2e6')),
+            ('LINEBELOW', (0, 0), (-1, 0), 2, CYBER_GREEN),
+            ('TOPPADDING', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+        ]
+        
+        ip_tbl.setStyle(TableStyle(ip_style))
+        story.append(ip_tbl)
+        story.append(Spacer(1, 0.3*inch))
+    
+    # ═══════════════════════════════════════════════════════════════
+    # VISUAL CHARTS SECTION
+    # ═══════════════════════════════════════════════════════════════
+    if include_charts and filtered_attacks:
+        story.append(PageBreak())
+        story.append(Paragraph("[#] VISUAL ANALYTICS", section_title))
+        
+        # Create professional chart container
+        chart_intro = """The following charts provide visual representation of the attack patterns 
+        and threat distribution identified in this analysis."""
+        story.append(Paragraph(chart_intro, body))
+        story.append(Spacer(1, 0.2*inch))
+        
+        # Attack distribution chart
+        story.append(Paragraph("<b>Attack Type Distribution</b>", body))
+        chart_b64 = create_attack_chart(filtered_attacks, 'Threats by Attack Type', 'horizontal_bar')
+        chart_img = Image(io.BytesIO(base64.b64decode(chart_b64)), width=5.5*inch, height=3.2*inch)
+        story.append(chart_img)
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Top attacker IPs chart
+        if attack_ips:
+            story.append(Paragraph("<b>Most Active Attacker IPs</b>", body))
+            ip_chart_b64 = create_attack_chart(dict(attack_ips.most_common(8)), 'Attack Frequency by IP', 'horizontal_bar')
+            ip_chart_img = Image(io.BytesIO(base64.b64decode(ip_chart_b64)), width=5.5*inch, height=3.2*inch)
+            story.append(ip_chart_img)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # DETAILED ATTACK BREAKDOWN - Professional styling
+    # ═══════════════════════════════════════════════════════════════
+    if include_details:
+        story.append(PageBreak())
+        story.append(Paragraph("[*] DETAILED ATTACK ANALYSIS", section_title))
+        
+        detail_intro = """Each attack type is analyzed below with specific details, 
+        source IP information, and sample log entries for forensic investigation."""
+        story.append(Paragraph(detail_intro, body))
+        story.append(Spacer(1, 0.2*inch))
+        
+        for attack_type in selected_attacks:
+            count = filtered_attacks.get(attack_type, 0)
+            if count == 0:
+                continue
+            
+            # Get severity and color from config
+            attack_color, severity, priority = SEVERITY_CONFIG.get(attack_type, (SLATE, 'INFO', 1))
+            
+            # Professional attack header box
+            attack_header_data = [[f'[!] {attack_type.upper()}']]
+            attack_header_tbl = Table(attack_header_data, colWidths=[6.5*inch])
+            
+            # Set background color based on severity
+            if severity == 'CRITICAL':
+                header_bg = colors.HexColor('#ffe8e8')
+                border_color = CRITICAL_RED
+            elif severity == 'HIGH':
+                header_bg = colors.HexColor('#fff3e0')
+                border_color = HIGH_ORANGE
+            elif severity == 'MEDIUM':
+                header_bg = colors.HexColor('#fffde7')
+                border_color = MEDIUM_YELLOW
+            else:
+                header_bg = colors.HexColor('#e3f2fd')
+                border_color = LOW_BLUE
+            
+            attack_header_tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), header_bg),
+                ('TEXTCOLOR', (0, 0), (-1, -1), attack_color),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 13),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 15),
+                ('TOPPADDING', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                ('BOX', (0, 0), (-1, -1), 2, border_color),
+            ]))
+            story.append(attack_header_tbl)
+            
+            # Attack info table - professional
+            attack_logs = [log for log in filtered_logs if log.get('attack_type') == attack_type]
+            attack_specific_ips = Counter(log.get('ip', 'Unknown') for log in attack_logs)
+            
+            info_data = [
+                ['Severity', 'Occurrences', 'Unique Source IPs', 'Priority'],
+                [severity, f'{count:,}', str(len(attack_specific_ips)), '●' * priority]
+            ]
+            
+            info_table = Table(info_data, colWidths=[1.5*inch, 1.5*inch, 1.8*inch, 1.5*inch])
+            info_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('FONTSIZE', (0, 1), (-1, 1), 11),
+                ('TEXTCOLOR', (0, 0), (-1, 0), SLATE),
+                ('TEXTCOLOR', (0, 1), (0, 1), attack_color),
+                ('TEXTCOLOR', (3, 1), (3, 1), attack_color),
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
+                ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#dee2e6')),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ]))
+            story.append(info_table)
+            
+            # Top IPs for this attack - styled
+            if attack_specific_ips:
+                top_ips_text = ', '.join([f'<font color="#0a192f"><b>{ip}</b></font> ({cnt})' 
+                                          for ip, cnt in attack_specific_ips.most_common(5)])
+                story.append(Spacer(1, 0.05*inch))
+                story.append(Paragraph(f"<b>Top Source IPs:</b> {top_ips_text}", small_text))
+            
+            # Sample log entries table - professional styling
+            if attack_logs:
+                story.append(Spacer(1, 0.1*inch))
+                
+                sample_entries = attack_logs[:5]
+                entry_data = [['IP Address', 'Method', 'Endpoint', 'Status']]
+                for entry in sample_entries:
+                    endpoint = entry.get('endpoint', 'N/A')
+                    if len(endpoint) > 45:
+                        endpoint = endpoint[:42] + '...'
+                    entry_data.append([
+                        entry.get('ip', 'N/A')[:15],
+                        entry.get('method', 'N/A'),
+                        endpoint,
+                        str(entry.get('status', 'N/A'))
+                    ])
+                
+                entry_table = Table(entry_data, colWidths=[1.3*inch, 0.7*inch, 3.5*inch, 0.8*inch])
+                entry_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), DARK_NAVY),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), CYBER_GREEN),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 8),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Courier'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, colors.HexColor('#f8f9fa')]),
+                    ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#dee2e6')),
+                    ('LINEBELOW', (0, 0), (-1, 0), 1, CYBER_GREEN),
+                    ('TOPPADDING', (0, 0), (-1, -1), 5),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 5),
+                    ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+                    ('ALIGN', (3, 0), (3, -1), 'CENTER'),
+                ]))
+                story.append(entry_table)
+            
+            story.append(Spacer(1, 0.25*inch))
+    
+    # ═══════════════════════════════════════════════════════════════
+    # RECOMMENDATIONS - Professional styling
+    # ═══════════════════════════════════════════════════════════════
+    story.append(PageBreak())
+    story.append(Paragraph("[i] SECURITY RECOMMENDATIONS", section_title))
+    
+    rec_intro = """Based on the attack patterns identified, the following remediation 
+    steps are recommended to strengthen your security posture:"""
+    story.append(Paragraph(rec_intro, body))
+    story.append(Spacer(1, 0.2*inch))
+    
+    recommendations = {
+        'SQL Injection': [
+            'Use parameterized queries and prepared statements',
+            'Implement input validation and sanitization',
+            'Deploy a Web Application Firewall (WAF)',
+            'Regular security audits of database queries'
+        ],
+        'Remote Code Execution': [
+            'CRITICAL: Immediately patch vulnerable applications',
+            'Disable dangerous functions (eval, exec, system)',
+            'Implement strict input validation',
+            'Use application sandboxing'
+        ],
+        'LFI / Path Traversal': [
+            'Validate and sanitize file paths',
+            'Use whitelists for allowed files',
+            'Implement proper access controls',
+            'Disable directory listing'
+        ],
+        'XSS Attempt': [
+            'Encode output data properly',
+            'Use Content Security Policy (CSP) headers',
+            'Validate and sanitize user input',
+            'Use HTTPOnly and Secure flags for cookies'
+        ],
+        'SSH Brute Force': [
+            'Implement fail2ban or similar tools',
+            'Use key-based authentication only',
+            'Change default SSH port',
+            'Limit SSH access by IP whitelist'
+        ],
+        'Auth Brute Force': [
+            'Implement rate limiting',
+            'Use CAPTCHA after failed attempts',
+            'Enable account lockout policies',
+            'Implement MFA/2FA'
+        ],
+        'FTP Brute Force': [
+            'Disable FTP, use SFTP instead',
+            'Implement IP-based access controls',
+            'Enable account lockout after failed attempts',
+            'Use strong authentication mechanisms'
+        ],
+        'SMTP Attack': [
+            'Implement DMARC, DKIM, and SPF',
+            'Use authenticated SMTP relay',
+            'Rate limit outgoing emails',
+            'Monitor for unusual email patterns'
+        ],
+        'Sensitive File Scan': [
+            'Remove sensitive files from web root',
+            'Configure proper file permissions',
+            'Block access to sensitive paths in web server',
+            'Monitor for unauthorized access attempts'
+        ],
+        'Database Attack': [
+            'Restrict database network access',
+            'Use least privilege principle for DB users',
+            'Enable query logging and monitoring',
+            'Regular patching of database software'
+        ],
+        'WAF Block': [
+            'Review WAF rules for accuracy',
+            'Analyze blocked patterns for false positives',
+            'Update WAF signatures regularly',
+            'Implement rate limiting'
+        ],
+        'Automated Scanner': [
+            'Implement rate limiting on all endpoints',
+            'Use CAPTCHA for sensitive operations',
+            'Deploy honeypot pages',
+            'Monitor and block scanner user agents'
+        ],
+        'Probe / Scan': [
+            'Close unnecessary ports',
+            'Implement network segmentation',
+            'Deploy intrusion detection systems',
+            'Regular vulnerability assessments'
+        ],
+    }
+    
+    rec_count = 0
+    for attack_type in selected_attacks:
+        if attack_type in recommendations:
+            rec_count += 1
+            
+            # Get attack color
+            attack_color, severity, _ = SEVERITY_CONFIG.get(attack_type, (SLATE, 'INFO', 1))
+            
+            # Styled recommendation header
+            rec_header_data = [[f'>> {attack_type}']]
+            rec_header_tbl = Table(rec_header_data, colWidths=[6.5*inch])
+            rec_header_tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), DARK_NAVY),
+                ('TEXTCOLOR', (0, 0), (-1, -1), CYBER_GREEN),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 11),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 12),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ]))
+            story.append(rec_header_tbl)
+            
+            # Recommendation items as styled list
+            rec_items = recommendations[attack_type]
+            rec_data = [[f'✓ {rec}'] for rec in rec_items]
+            rec_tbl = Table(rec_data, colWidths=[6.5*inch])
+            rec_tbl.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
+                ('TEXTCOLOR', (0, 0), (-1, -1), DARK_NAVY),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 20),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('BOX', (0, 0), (-1, -1), 1, colors.HexColor('#dee2e6')),
+            ]))
+            story.append(rec_tbl)
+            story.append(Spacer(1, 0.15*inch))
+    
+    # If no specific recommendations, add general ones
+    if rec_count == 0:
+        story.append(Paragraph("<b>General Security Recommendations:</b>", body))
+        general_recs = [
+            '• Keep all systems and software updated',
+            '• Implement defense-in-depth strategies',
+            '• Regular security audits and penetration testing',
+            '• Employee security awareness training',
+            '• Implement comprehensive logging and monitoring'
+        ]
+        for rec in general_recs:
+            story.append(Paragraph(rec, body))
+    
+    # ═══════════════════════════════════════════════════════════════
+    # PROFESSIONAL FOOTER
+    # ═══════════════════════════════════════════════════════════════
+    story.append(Spacer(1, 0.5*inch))
+    
+    # Footer line
+    footer_line = Table([['']], colWidths=[6.5*inch])
+    footer_line.setStyle(TableStyle([
+        ('LINEABOVE', (0, 0), (-1, -1), 2, colors.HexColor('#e9ecef')),
+    ]))
+    story.append(footer_line)
+    story.append(Spacer(1, 0.1*inch))
+    
+    footer_data = [
+        ['DATASMITH PRO', 'Attack Analysis Report', f'ID: ATK-{report_id}'],
+        ['Security Intelligence Platform', report_date, 'CONFIDENTIAL']
+    ]
+    footer_tbl = Table(footer_data, colWidths=[2.2*inch, 2.2*inch, 2.2*inch])
+    footer_tbl.setStyle(TableStyle([
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'CENTER'),
+        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTNAME', (0, 1), (-1, 1), 'Helvetica'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('TEXTCOLOR', (0, 0), (-1, -1), SLATE),
+        ('TEXTCOLOR', (2, 1), (2, 1), CRITICAL_RED),
+        ('TOPPADDING', (0, 0), (-1, -1), 3),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+    ]))
+    story.append(footer_tbl)
+    
+    story.append(Spacer(1, 0.1*inch))
+    disclaimer = """<para alignment="center"><font color="#8892b0" size="7">
+    This report contains confidential security information. Unauthorized distribution is prohibited.
+    © 2025 DataSmith Pro. All rights reserved.
+    </font></para>"""
+    story.append(Paragraph(disclaimer, body))
+    
+    # Build PDF
+    doc.build(story)
+    buffer.seek(0)
+    
+    # Generate filename based on attacks
+    attack_names = '_'.join([a.replace(' ', '').replace('/', '')[:10] for a in selected_attacks[:3]])
+    filename = f'DataSmith_Attack_Report_{attack_names}_{report_id}.pdf'
+    
+    return send_file(
+        buffer,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=filename
+    )
+
+
+@app.route('/available-attacks', methods=['GET'])
+def get_available_attacks():
+    """Get list of all available attack types for filtering"""
+    attack_list = [
+        {'name': 'SQL Injection', 'severity': 'CRITICAL', 'color': '#ff4757'},
+        {'name': 'Remote Code Execution', 'severity': 'CRITICAL', 'color': '#ff4757'},
+        {'name': 'LFI / Path Traversal', 'severity': 'CRITICAL', 'color': '#ff4757'},
+        {'name': 'XSS Attempt', 'severity': 'HIGH', 'color': '#ffa502'},
+        {'name': 'Database Attack', 'severity': 'HIGH', 'color': '#ffa502'},
+        {'name': 'WAF Block', 'severity': 'HIGH', 'color': '#ffa502'},
+        {'name': 'Cloud Security Event', 'severity': 'HIGH', 'color': '#ffa502'},
+        {'name': 'SSH Brute Force', 'severity': 'MEDIUM', 'color': '#ffdd59'},
+        {'name': 'Auth Brute Force', 'severity': 'MEDIUM', 'color': '#ffdd59'},
+        {'name': 'FTP Brute Force', 'severity': 'MEDIUM', 'color': '#ffdd59'},
+        {'name': 'SMTP Attack', 'severity': 'MEDIUM', 'color': '#ffdd59'},
+        {'name': 'Windows Auth Failure', 'severity': 'MEDIUM', 'color': '#ffdd59'},
+        {'name': 'VPN Auth Failure', 'severity': 'MEDIUM', 'color': '#ffdd59'},
+        {'name': 'Sensitive File Scan', 'severity': 'LOW', 'color': '#70a1ff'},
+        {'name': 'Automated Scanner', 'severity': 'LOW', 'color': '#70a1ff'},
+        {'name': 'Probe / Scan', 'severity': 'LOW', 'color': '#70a1ff'},
+        {'name': 'Suspicious DNS Query', 'severity': 'LOW', 'color': '#70a1ff'},
+        {'name': 'Blocked Connection', 'severity': 'INFO', 'color': '#8892b0'},
+        {'name': 'Server Error', 'severity': 'INFO', 'color': '#8892b0'},
+        {'name': 'Container Error', 'severity': 'INFO', 'color': '#8892b0'},
+    ]
+    return jsonify(attack_list)
 
 
 @app.route('/generate-report', methods=['POST'])
@@ -1433,5 +2239,128 @@ def generate_report():
         download_name=f'DataSmith_Report_{report_id}.pdf'
     )
 
+
+# ================== LIVE MONITORING ENDPOINTS ==================
+
+@app.route('/live/start', methods=['POST'])
+def start_live_monitoring():
+    """Start watching a log file for real-time updates"""
+    try:
+        data = request.json
+        filepath = data.get('filepath')
+        
+        if not filepath:
+            return jsonify({'error': 'No filepath provided'}), 400
+        
+        # Resolve absolute path
+        if not os.path.isabs(filepath):
+            filepath = os.path.abspath(filepath)
+        
+        if not os.path.exists(filepath):
+            return jsonify({'error': f'File not found: {filepath}'}), 404
+        
+        monitor.start_watching(filepath)
+        
+        return jsonify({
+            'success': True,
+            'message': f'Started monitoring: {filepath}',
+            'filepath': filepath
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/live/stop', methods=['POST'])
+def stop_live_monitoring():
+    """Stop the current live monitoring session"""
+    try:
+        monitor.stop_watching()
+        return jsonify({'success': True, 'message': 'Monitoring stopped'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/live/status', methods=['GET'])
+def get_live_status():
+    """Get current live monitoring status and stats"""
+    try:
+        return jsonify({
+            'watching': monitor.is_watching(),
+            'filepath': monitor.get_watch_path(),
+            'stats': monitor.get_stats() if monitor.is_watching() else None
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/live/stats', methods=['GET'])
+def get_live_stats():
+    """Get current live statistics"""
+    try:
+        if not monitor.is_watching():
+            return jsonify({'error': 'Not currently monitoring any file'}), 400
+        
+        return jsonify(monitor.get_stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ================== SOCKET.IO EVENTS ==================
+
+@socketio.on('connect', namespace='/live')
+def handle_connect():
+    """Handle client connection"""
+    print(f'Client connected to live feed')
+    if monitor.is_watching():
+        emit('stats_update', monitor.get_stats())
+
+
+@socketio.on('disconnect', namespace='/live')
+def handle_disconnect():
+    """Handle client disconnection"""
+    print(f'Client disconnected from live feed')
+
+
+@socketio.on('request_stats', namespace='/live')
+def handle_request_stats():
+    """Handle client requesting current stats"""
+    if monitor.is_watching():
+        emit('stats_update', monitor.get_stats())
+
+
+def get_local_ip():
+    """Get the local IP address of this machine on the network"""
+    import socket
+    try:
+        # Connect to an external address to determine local IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except Exception:
+        return "127.0.0.1"
+
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    local_ip = get_local_ip()
+    port = 5000
+    
+    print("\n" + "="*60)
+    print("       DATASMITH ENGINE - Security Log Analyzer")
+    print("="*60)
+    print("\n[+] Server Starting...")
+    print(f"[+] Local Access:   http://localhost:{port}")
+    print(f"[+] Network Access: http://{local_ip}:{port}")
+    print("\n[*] Share the Network URL with devices on your WiFi!")
+    print("="*60)
+    print("\n[API Endpoints]")
+    print("   POST /live/start  - Start monitoring a log file")
+    print("   POST /live/stop   - Stop monitoring")
+    print("   GET  /live/status - Get monitoring status")
+    print("   GET  /live/stats  - Get current statistics")
+    print("="*60 + "\n")
+    
+    # Run on all network interfaces (0.0.0.0) to allow WiFi access
+    socketio.run(app, debug=True, host='0.0.0.0', port=port)

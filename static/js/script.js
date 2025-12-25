@@ -116,6 +116,9 @@ function handleFileSelect(file) {
     analyzeSection.style.display = 'block';
 }
 
+// Progress polling interval
+let progressInterval = null;
+
 // =================== ANALYSIS ===================
 async function analyzeFile() {
     if (!selectedFile) {
@@ -123,25 +126,53 @@ async function analyzeFile() {
         return;
     }
     
-    const loading = document.getElementById('loading');
+    const pipelineContainer = document.getElementById('pipelineContainer');
     const results = document.getElementById('results');
     const errorMessage = document.getElementById('errorMessage');
     const analyzeSection = document.getElementById('analyzeSection');
     
-    // Show loading
-    loading.style.display = 'block';
+    // Show pipeline animation
+    pipelineContainer.style.display = 'block';
     results.style.display = 'none';
     errorMessage.style.display = 'none';
     analyzeSection.style.display = 'none';
+    
+    // Reset pipeline
+    resetPipeline();
+    
+    // Stage 1: File Upload (already completed)
+    updatePipelineStage(1, 'completed', 'Completed');
+    await sleep(300);
+    
+    // Stage 2: Parsing - Start
+    updatePipelineStage(2, 'active', 'Processing...');
+    updateConnector(1, 'active');
+    updatePipelineProgress(15);
     
     try {
         const formData = new FormData();
         formData.append('file', selectedFile);
         
+        // Start polling for real-time progress
+        startProgressPolling();
+        
+        updatePipelineStage(2, 'completed', 'Completed');
+        updateConnector(1, 'completed');
+        updatePipelineProgress(25);
+        await sleep(200);
+        
+        // Stage 3: Threat Detection - Active during API call
+        updatePipelineStage(3, 'active', 'Scanning...');
+        updateConnector(2, 'active');
+        updatePipelineProgress(35);
+        
         const response = await fetch('/analyze', {
             method: 'POST',
             body: formData
         });
+        
+        // Stop progress polling
+        stopProgressPolling();
         
         if (!response.ok) {
             throw new Error('Analysis failed');
@@ -150,22 +181,195 @@ async function analyzeFile() {
         const data = await response.json();
         currentAnalysisData = data;
         
+        // Update with final actual data
+        updatePipelineStats(data.metrics.total || 0, data.metrics.threats || 0, 50);
+        
+        updatePipelineStage(3, 'completed', 'Completed');
+        updateConnector(2, 'completed');
+        updatePipelineProgress(50);
+        await sleep(300);
+        
+        // Stage 4: Pattern Analysis
+        updatePipelineStage(4, 'active', 'Analyzing...');
+        updateConnector(3, 'active');
+        updatePipelineProgress(65);
+        updatePipelineStats(data.metrics.total, data.metrics.threats, 65);
+        await sleep(400);
+        
+        updatePipelineStage(4, 'completed', 'Completed');
+        updateConnector(3, 'completed');
+        updatePipelineProgress(75);
+        await sleep(200);
+        
+        // Stage 5: Generate Insights
+        updatePipelineStage(5, 'active', 'Generating...');
+        updateConnector(4, 'active');
+        updatePipelineProgress(85);
+        updatePipelineStats(data.metrics.total, data.metrics.threats, 85);
+        await sleep(400);
+        
+        updatePipelineStage(5, 'completed', 'Completed');
+        updateConnector(4, 'completed');
+        updatePipelineProgress(92);
+        await sleep(200);
+        
+        // Stage 6: Building Dashboard
+        updatePipelineStage(6, 'active', 'Building...');
+        updateConnector(5, 'active');
+        updatePipelineProgress(95);
+        
         // Display results
         displayResults(data);
         
         // Save to history
         saveToHistory(data);
         
-        // Hide loading, show results
-        loading.style.display = 'none';
+        updatePipelineStage(6, 'completed', 'Completed');
+        updateConnector(5, 'completed');
+        updatePipelineProgress(100);
+        updatePipelineStats(data.metrics.total, data.metrics.threats, 100);
+        
+        // Add complete animation
+        pipelineContainer.classList.add('complete');
+        
+        await sleep(800);
+        
+        // Hide pipeline, show results with animation
+        pipelineContainer.style.display = 'none';
         results.style.display = 'block';
+        results.classList.add('reveal');
+        
+        // Remove reveal class after animation
+        setTimeout(() => {
+            results.classList.remove('reveal');
+        }, 1000);
         
     } catch (error) {
-        loading.style.display = 'none';
+        stopProgressPolling();
+        pipelineContainer.style.display = 'none';
         errorMessage.style.display = 'flex';
         document.getElementById('errorText').textContent = error.message;
         analyzeSection.style.display = 'block';
     }
+}
+
+// Real-time progress polling functions
+function startProgressPolling() {
+    // Poll every 500ms for real-time progress updates
+    progressInterval = setInterval(async () => {
+        try {
+            const response = await fetch('/analysis-progress');
+            if (response.ok) {
+                const progress = await response.json();
+                // Update UI with actual lines processed
+                updatePipelineStats(
+                    progress.lines_processed || 0, 
+                    progress.threats_found || 0, 
+                    progress.progress_percent || 0
+                );
+            }
+        } catch (e) {
+            // Ignore polling errors
+        }
+    }, 500);
+}
+
+function stopProgressPolling() {
+    if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
+    }
+}
+
+// Pipeline helper functions
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function resetPipeline() {
+    // Reset all stages
+    for (let i = 1; i <= 6; i++) {
+        const stage = document.getElementById(`stage${i}`);
+        if (stage) {
+            stage.classList.remove('active', 'completed');
+            const status = stage.querySelector('.stage-status');
+            if (status) status.textContent = 'Waiting...';
+        }
+        
+        if (i < 6) {
+            const connector = document.getElementById(`connector${i}`);
+            if (connector) {
+                connector.classList.remove('active', 'completed');
+            }
+        }
+    }
+    
+    // Reset progress bar
+    const progressBar = document.getElementById('pipelineProgressBar');
+    if (progressBar) progressBar.style.width = '0%';
+    
+    // Reset stats
+    updatePipelineStats(0, 0, 0);
+    
+    // Remove complete class
+    const container = document.getElementById('pipelineContainer');
+    if (container) container.classList.remove('complete');
+}
+
+function updatePipelineStage(stageNum, state, statusText) {
+    const stage = document.getElementById(`stage${stageNum}`);
+    if (!stage) return;
+    
+    stage.classList.remove('active', 'completed');
+    
+    if (state === 'active') {
+        stage.classList.add('active');
+    } else if (state === 'completed') {
+        stage.classList.add('completed');
+    }
+    
+    const status = stage.querySelector('.stage-status');
+    if (status) status.textContent = statusText;
+    
+    // Update indicator
+    const indicator = stage.querySelector('.stage-indicator');
+    if (indicator && state === 'completed') {
+        indicator.classList.add('completed');
+        indicator.innerHTML = '<i class="bi bi-check-lg"></i>';
+    }
+}
+
+function updateConnector(connectorNum, state) {
+    const connector = document.getElementById(`connector${connectorNum}`);
+    if (!connector) return;
+    
+    connector.classList.remove('active', 'completed');
+    
+    if (state === 'active') {
+        connector.classList.add('active');
+    } else if (state === 'completed') {
+        connector.classList.add('completed');
+    }
+}
+
+function updatePipelineProgress(percent) {
+    const progressBar = document.getElementById('pipelineProgressBar');
+    if (progressBar) {
+        progressBar.style.width = `${percent}%`;
+    }
+    
+    const progressLabel = document.getElementById('pipelineProgress');
+    if (progressLabel) {
+        progressLabel.textContent = `${percent}%`;
+    }
+}
+
+function updatePipelineStats(lines, threats, progress) {
+    const linesEl = document.getElementById('pipelineLinesProcessed');
+    const threatsEl = document.getElementById('pipelineThreatsFound');
+    
+    if (linesEl) linesEl.textContent = lines.toLocaleString();
+    if (threatsEl) threatsEl.textContent = threats.toLocaleString();
 }
 
 // =================== DISPLAY RESULTS ===================
@@ -927,4 +1131,215 @@ async function deleteHistory(id) {
     } catch (error) {
         alert('Failed to delete: ' + error.message);
     }
+}
+
+// =================== ATTACK REPORT MODAL ===================
+let availableAttacks = [];
+let attackReportModal = null;
+
+async function openReportModal() {
+    if (!currentAnalysisData) {
+        alert('No data to export. Please run an analysis first.');
+        return;
+    }
+    
+    // Initialize modal
+    if (!attackReportModal) {
+        attackReportModal = new bootstrap.Modal(document.getElementById('attackReportModal'));
+    }
+    
+    // Load available attacks
+    await loadAvailableAttacks();
+    
+    // Show modal
+    attackReportModal.show();
+}
+
+async function loadAvailableAttacks() {
+    try {
+        const response = await fetch('/available-attacks');
+        availableAttacks = await response.json();
+        
+        renderAttackTypesList();
+    } catch (error) {
+        console.error('Failed to load attacks:', error);
+    }
+}
+
+function renderAttackTypesList() {
+    const container = document.getElementById('attackTypesList');
+    const detectedAttacks = currentAnalysisData?.attack_types || {};
+    
+    // Group by severity
+    const severityGroups = {
+        'CRITICAL': { label: 'Critical', color: '#dc2626', bgColor: '#fef2f2', icon: 'exclamation-triangle-fill' },
+        'HIGH': { label: 'High', color: '#ea580c', bgColor: '#fff7ed', icon: 'exclamation-circle-fill' },
+        'MEDIUM': { label: 'Medium', color: '#ca8a04', bgColor: '#fefce8', icon: 'info-circle-fill' },
+        'LOW': { label: 'Low', color: '#2563eb', bgColor: '#eff6ff', icon: 'shield-check' },
+        'INFO': { label: 'Info', color: '#6b7280', bgColor: '#f9fafb', icon: 'info-circle' }
+    };
+    
+    let html = '';
+    
+    // Group attacks by severity
+    const grouped = {};
+    availableAttacks.forEach(attack => {
+        const sev = attack.severity;
+        if (!grouped[sev]) grouped[sev] = [];
+        grouped[sev].push(attack);
+    });
+    
+    // Render each severity group
+    Object.keys(severityGroups).forEach(severity => {
+        const attacks = grouped[severity] || [];
+        if (attacks.length === 0) return;
+        
+        const group = severityGroups[severity];
+        
+        html += `
+            <div style="margin-bottom: 0.75rem;">
+                <div style="display: flex; align-items: center; gap: 6px; padding: 0.5rem 0.75rem; background: ${group.bgColor}; border-radius: 8px; margin-bottom: 0.5rem;">
+                    <i class="bi bi-${group.icon}" style="color: ${group.color};"></i>
+                    <span style="font-weight: 600; font-size: 0.85rem; color: ${group.color};">${group.label}</span>
+                </div>
+                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.5rem; padding: 0 0.5rem;">
+        `;
+        
+        attacks.forEach(attack => {
+            const count = detectedAttacks[attack.name] || 0;
+            const isDetected = count > 0;
+            const checkboxId = `attack_${attack.name.replace(/[^a-zA-Z0-9]/g, '_')}`;
+            
+            html += `
+                <label style="display: flex; align-items: center; gap: 8px; padding: 0.5rem 0.75rem; 
+                       background: ${isDetected ? '#f0fdf4' : '#fff'}; 
+                       border: 1px solid ${isDetected ? '#86efac' : '#e5e7eb'}; 
+                       border-radius: 8px; cursor: pointer; transition: all 0.15s;"
+                       onmouseover="this.style.borderColor='#000'" 
+                       onmouseout="this.style.borderColor='${isDetected ? '#86efac' : '#e5e7eb'}'">
+                    <input type="checkbox" 
+                           id="${checkboxId}"
+                           class="attack-checkbox" 
+                           data-attack="${attack.name}" 
+                           data-severity="${attack.severity}"
+                           data-count="${count}"
+                           ${isDetected ? 'checked' : ''}
+                           onchange="updateSelectedCount()"
+                           style="width: 16px; height: 16px; accent-color: ${attack.color};">
+                    <div style="flex: 1; min-width: 0;">
+                        <div style="font-size: 0.85rem; font-weight: 500; color: #111; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                            ${attack.name}
+                        </div>
+                        ${isDetected ? `<div style="font-size: 0.75rem; color: #16a34a; font-weight: 600;">${count.toLocaleString()} detected</div>` : 
+                                       `<div style="font-size: 0.75rem; color: #9ca3af;">Not detected</div>`}
+                    </div>
+                </label>
+            `;
+        });
+        
+        html += '</div></div>';
+    });
+    
+    container.innerHTML = html;
+    updateSelectedCount();
+}
+
+function selectAttacksBySeverity(severity) {
+    const checkboxes = document.querySelectorAll('.attack-checkbox');
+    
+    checkboxes.forEach(cb => {
+        if (severity === 'all') {
+            cb.checked = true;
+        } else if (severity === 'none') {
+            cb.checked = false;
+        } else {
+            if (cb.dataset.severity === severity) {
+                cb.checked = true;
+            }
+        }
+    });
+    
+    updateSelectedCount();
+}
+
+function updateSelectedCount() {
+    const checkboxes = document.querySelectorAll('.attack-checkbox:checked');
+    let totalThreats = 0;
+    
+    checkboxes.forEach(cb => {
+        totalThreats += parseInt(cb.dataset.count) || 0;
+    });
+    
+    document.getElementById('selectedAttackCount').textContent = checkboxes.length;
+    document.getElementById('selectedThreatCount').textContent = `${totalThreats.toLocaleString()} threats`;
+    
+    // Enable/disable generate button
+    const btn = document.getElementById('generateReportBtn');
+    if (checkboxes.length === 0) {
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+    } else {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+    }
+}
+
+async function generateAttackReport() {
+    const checkboxes = document.querySelectorAll('.attack-checkbox:checked');
+    const selectedAttacks = Array.from(checkboxes).map(cb => cb.dataset.attack);
+    
+    if (selectedAttacks.length === 0) {
+        alert('Please select at least one attack type');
+        return;
+    }
+    
+    const includeCharts = document.getElementById('includeCharts').checked;
+    const includeDetails = document.getElementById('includeDetails').checked;
+    
+    // Show loading state
+    const btn = document.getElementById('generateReportBtn');
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<i class="bi bi-hourglass-split"></i> Generating...';
+    btn.disabled = true;
+    
+    try {
+        const response = await fetch('/generate-attack-report', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                selected_attacks: selectedAttacks,
+                metrics: currentAnalysisData.metrics,
+                attack_types: currentAnalysisData.attack_types,
+                top_ips: currentAnalysisData.top_ips,
+                log_data: currentAnalysisData.log_data || [],
+                include_charts: includeCharts,
+                include_details: includeDetails
+            })
+        });
+        
+        if (!response.ok) {
+            throw new Error('Failed to generate report');
+        }
+        
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `DataSmith_Attack_Report_${Date.now()}.pdf`;
+        a.click();
+        
+        // Close modal
+        attackReportModal.hide();
+        
+    } catch (error) {
+        alert('Report generation failed: ' + error.message);
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+}
+
+// Keep the old generatePDF function as fallback
+async function generatePDF() {
+    openReportModal();
 }
