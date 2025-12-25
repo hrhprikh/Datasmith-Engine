@@ -4,6 +4,7 @@ import io
 import base64
 import json
 import csv
+import gc
 from collections import Counter
 import pandas as pd
 import matplotlib
@@ -26,7 +27,7 @@ mpl.rcParams.update({
 })
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
 
 # ---------------- REGEX PATTERNS ----------------
 
@@ -289,13 +290,17 @@ def analyze():
     }
     
     ip_activity = Counter()
-    log_entries = []  # Store all parsed log entries
+    log_entries = []  # Store suspicious/attack log entries only (limited)
     
-    # ---------------- PARSING ----------------
-    content = file.read()
-    lines = content.split(b"\n")
+    # ---------------- CONFIGURATION FOR LARGE FILES ----------------
+    MAX_LOG_ENTRIES = 10000  # Limit stored entries to prevent memory overflow
+    BATCH_SIZE = 50000  # Process in batches for progress tracking
     
-    for raw in lines:
+    # ---------------- STREAMING LINE-BY-LINE PARSING ----------------
+    # Read file in streaming mode to handle large files efficiently
+    file.seek(0)  # Ensure we're at the start
+    
+    for raw in file:
         if not raw:
             continue
         
@@ -304,6 +309,11 @@ def analyze():
             continue
         
         stats["total"] += 1
+        
+        # Garbage collection every 100K lines to free memory
+        if stats["total"] % 100000 == 0:
+            gc.collect()
+        
         parsed = False
         
         # ---- WEB ACCESS LOG ----
@@ -325,15 +335,17 @@ def analyze():
                 
                 if attack != "Normal":
                     stats["attack_types"][attack] += 1
+                    # Only store suspicious entries to save memory
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': method,
+                            'endpoint': endpoint,
+                            'status': str(status),
+                            'attack_type': attack,
+                            'log_type': 'Web Access Log'
+                        })
                 
-                log_entries.append({
-                    'ip': ip,
-                    'method': method,
-                    'endpoint': endpoint,
-                    'status': str(status),
-                    'attack_type': attack,
-                    'log_type': 'Web Access Log'
-                })
                 parsed = True
         
         # ---- API ACCESS LOG ----
@@ -354,15 +366,15 @@ def analyze():
                 attack = classify_web_attack(endpoint, status)
                 if attack != "Normal":
                     stats["attack_types"][attack] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': method,
-                    'endpoint': endpoint,
-                    'status': str(status),
-                    'attack_type': attack,
-                    'log_type': 'API Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': method,
+                            'endpoint': endpoint,
+                            'status': str(status),
+                            'attack_type': attack,
+                            'log_type': 'API Log'
+                        })
                 parsed = True
         
         # ---- SSH LOG ----
@@ -382,15 +394,15 @@ def analyze():
                 else:
                     attack_type = "SSH Brute Force"
                     stats["attack_types"]["SSH Brute Force"] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'SSH',
-                    'endpoint': action,
-                    'status': 'Failed' if 'Failed' in action or 'Invalid' in action else 'Success',
-                    'attack_type': attack_type,
-                    'log_type': 'SSH Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'SSH',
+                            'endpoint': action,
+                            'status': 'Failed' if 'Failed' in action or 'Invalid' in action else 'Success',
+                            'attack_type': attack_type,
+                            'log_type': 'SSH Log'
+                        })
                 parsed = True
         
         # ---- FTP LOG ----
@@ -409,15 +421,15 @@ def analyze():
                 attack_type = "FTP Brute Force" if 'FAIL' in action.upper() else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'FTP',
-                    'endpoint': action,
-                    'status': 'Failed' if 'FAIL' in action.upper() else 'Success',
-                    'attack_type': attack_type,
-                    'log_type': 'FTP Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'FTP',
+                            'endpoint': action,
+                            'status': 'Failed' if 'FAIL' in action.upper() else 'Success',
+                            'attack_type': attack_type,
+                            'log_type': 'FTP Log'
+                        })
                 parsed = True
         
         # ---- SMTP/EMAIL LOG ----
@@ -436,15 +448,15 @@ def analyze():
                 attack_type = "SMTP Attack" if any(x in action.lower() for x in ['reject', 'denied', 'failed']) else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'SMTP',
-                    'endpoint': action,
-                    'status': 'Blocked' if attack_type != "Normal" else 'OK',
-                    'attack_type': attack_type,
-                    'log_type': 'SMTP Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'SMTP',
+                            'endpoint': action,
+                            'status': 'Blocked' if attack_type != "Normal" else 'OK',
+                            'attack_type': attack_type,
+                            'log_type': 'SMTP Log'
+                        })
                 parsed = True
         
         # ---- DATABASE LOG ----
@@ -463,15 +475,15 @@ def analyze():
                 attack_type = "Database Attack" if any(x in action.lower() for x in ['denied', 'failed', 'invalid', 'refused']) else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'DB',
-                    'endpoint': action,
-                    'status': 'Failed' if attack_type != "Normal" else 'OK',
-                    'attack_type': attack_type,
-                    'log_type': 'Database Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'DB',
+                            'endpoint': action,
+                            'status': 'Failed' if attack_type != "Normal" else 'OK',
+                            'attack_type': attack_type,
+                            'log_type': 'Database Log'
+                        })
                 parsed = True
         
         # ---- FIREWALL LOG ----
@@ -490,14 +502,15 @@ def analyze():
                 
                 stats["attack_types"]["Blocked Connection"] += 1
                 
-                log_entries.append({
-                    'ip': src_ip,
-                    'method': 'FIREWALL',
-                    'endpoint': f'→ {dst_ip}:{port}',
-                    'status': 'Blocked',
-                    'attack_type': 'Blocked Connection',
-                    'log_type': 'Firewall Log'
-                })
+                if len(log_entries) < MAX_LOG_ENTRIES:
+                    log_entries.append({
+                        'ip': src_ip,
+                        'method': 'FIREWALL',
+                        'endpoint': f'→ {dst_ip}:{port}',
+                        'status': 'Blocked',
+                        'attack_type': 'Blocked Connection',
+                        'log_type': 'Firewall Log'
+                    })
                 parsed = True
         
         # ---- WINDOWS EVENT LOG ----
@@ -517,15 +530,15 @@ def analyze():
                 attack_type = "Windows Auth Failure" if event_id in ['4625', '4771', '4776'] else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'WINDOWS',
-                    'endpoint': f'EventID:{event_id}',
-                    'status': 'Failed' if attack_type != "Normal" else 'Success',
-                    'attack_type': attack_type,
-                    'log_type': 'Windows Event Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'WINDOWS',
+                            'endpoint': f'EventID:{event_id}',
+                            'status': 'Failed' if attack_type != "Normal" else 'Success',
+                            'attack_type': attack_type,
+                            'log_type': 'Windows Event Log'
+                        })
                 parsed = True
         
         # ---- VPN LOG ----
@@ -544,15 +557,15 @@ def analyze():
                 attack_type = "VPN Auth Failure" if 'failed' in action.lower() else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'VPN',
-                    'endpoint': action,
-                    'status': 'Failed' if 'failed' in action.lower() else 'Connected',
-                    'attack_type': attack_type,
-                    'log_type': 'VPN Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'VPN',
+                            'endpoint': action,
+                            'status': 'Failed' if 'failed' in action.lower() else 'Connected',
+                            'attack_type': attack_type,
+                            'log_type': 'VPN Log'
+                        })
                 parsed = True
         
         # ---- DNS LOG ----
@@ -573,15 +586,15 @@ def analyze():
                 attack_type = "Suspicious DNS Query" if any(domain.endswith(tld) for tld in suspicious_tlds) else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'DNS',
-                    'endpoint': domain,
-                    'status': 'Query',
-                    'attack_type': attack_type,
-                    'log_type': 'DNS Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'DNS',
+                            'endpoint': domain,
+                            'status': 'Query',
+                            'attack_type': attack_type,
+                            'log_type': 'DNS Log'
+                        })
                 parsed = True
         
         # ---- DOCKER/CONTAINER LOG ----
@@ -598,15 +611,15 @@ def analyze():
                 attack_type = "Container Error" if action.lower() in ['error', 'died', 'killed', 'oom'] else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': container_id[:12] if container_id != "Unknown" else "N/A",
-                    'method': 'DOCKER',
-                    'endpoint': action,
-                    'status': action.upper(),
-                    'attack_type': attack_type,
-                    'log_type': 'Container Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': container_id[:12] if container_id != "Unknown" else "N/A",
+                            'method': 'DOCKER',
+                            'endpoint': action,
+                            'status': action.upper(),
+                            'attack_type': attack_type,
+                            'log_type': 'Container Log'
+                        })
                 parsed = True
         
         # ---- CLOUD LOG (AWS/Azure/GCP) ----
@@ -625,15 +638,15 @@ def analyze():
                 attack_type = "Cloud Security Event" if any(x in action.lower() for x in ['unauthorized', 'denied', 'delete']) else "Normal"
                 if attack_type != "Normal":
                     stats["attack_types"][attack_type] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'CLOUD',
-                    'endpoint': action,
-                    'status': 'Alert' if attack_type != "Normal" else 'OK',
-                    'attack_type': attack_type,
-                    'log_type': 'Cloud Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': 'CLOUD',
+                            'endpoint': action,
+                            'status': 'Alert' if attack_type != "Normal" else 'OK',
+                            'attack_type': attack_type,
+                            'log_type': 'Cloud Log'
+                        })
                 parsed = True
         
         # ---- MODSECURITY/WAF LOG ----
@@ -652,14 +665,15 @@ def analyze():
                 
                 stats["attack_types"]["WAF Block"] += 1
                 
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'WAF',
-                    'endpoint': f'Rule:{rule_id}',
-                    'status': action,
-                    'attack_type': 'WAF Block',
-                    'log_type': 'WAF Log'
-                })
+                if len(log_entries) < MAX_LOG_ENTRIES:
+                    log_entries.append({
+                        'ip': ip,
+                        'method': 'WAF',
+                        'endpoint': f'Rule:{rule_id}',
+                        'status': action,
+                        'attack_type': 'WAF Block',
+                        'log_type': 'WAF Log'
+                    })
                 parsed = True
         
         # ---- NGINX ERROR LOG ----
@@ -676,15 +690,16 @@ def analyze():
                 if ip != "Unknown":
                     ip_activity[ip] += 1
                 
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'NGINX',
-                    'endpoint': message,
-                    'status': level.upper(),
-                    'attack_type': 'Server Error',
-                    'log_type': 'Nginx Error Log'
-                })
                 stats["attack_types"]["Server Error"] += 1
+                if len(log_entries) < MAX_LOG_ENTRIES:
+                    log_entries.append({
+                        'ip': ip,
+                        'method': 'NGINX',
+                        'endpoint': message,
+                        'status': level.upper(),
+                        'attack_type': 'Server Error',
+                        'log_type': 'Nginx Error Log'
+                    })
                 parsed = True
         
         # ---- APACHE ERROR LOG ----
@@ -701,15 +716,16 @@ def analyze():
                 if ip != "Unknown":
                     ip_activity[ip] += 1
                 
-                log_entries.append({
-                    'ip': ip,
-                    'method': 'APACHE',
-                    'endpoint': message,
-                    'status': level.upper(),
-                    'attack_type': 'Server Error',
-                    'log_type': 'Apache Error Log'
-                })
                 stats["attack_types"]["Server Error"] += 1
+                if len(log_entries) < MAX_LOG_ENTRIES:
+                    log_entries.append({
+                        'ip': ip,
+                        'method': 'APACHE',
+                        'endpoint': message,
+                        'status': level.upper(),
+                        'attack_type': 'Server Error',
+                        'log_type': 'Apache Error Log'
+                    })
                 parsed = True
         
         # ---- JSON LOG FORMAT ----
@@ -730,15 +746,15 @@ def analyze():
                 attack = classify_web_attack(endpoint, int(status))
                 if attack != "Normal":
                     stats["attack_types"][attack] += 1
-                
-                log_entries.append({
-                    'ip': ip,
-                    'method': method,
-                    'endpoint': endpoint,
-                    'status': str(status),
-                    'attack_type': attack,
-                    'log_type': 'JSON Log'
-                })
+                    if len(log_entries) < MAX_LOG_ENTRIES:
+                        log_entries.append({
+                            'ip': ip,
+                            'method': method,
+                            'endpoint': endpoint,
+                            'status': str(status),
+                            'attack_type': attack,
+                            'log_type': 'JSON Log'
+                        })
                 parsed = True
             except json.JSONDecodeError:
                 pass
@@ -761,20 +777,16 @@ def analyze():
                 if ip_match:
                     ip_activity[ip] += 1
                 
-                log_entries.append({
-                    'ip': ip,
-                    'method': process,
-                    'endpoint': message,
-                    'status': 'Info',
-                    'attack_type': 'Normal',
-                    'log_type': 'Syslog'
-                })
+                # Syslog entries are generally normal - don't store to save memory
                 parsed = True
         
         # ---- UNKNOWN LOG ----
         if not parsed:
             stats["unparsed"] += 1
             stats["log_types"]["Unknown Log"] += 1
+    
+    # Final garbage collection after processing
+    gc.collect()
     
     # ---------------- CREATE CHARTS ----------------
     charts = {}
