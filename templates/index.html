@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataSmith Pro - Security Log Analysis</title>
+    
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.2/font/bootstrap-icons.css">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <!-- Subtle Grid Background -->
+    <div class="bg-grid"></div>
+
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="navbar-content">
+            <a class="brand" href="#" onclick="showView('analysis'); return false;">
+                <div class="brand-icon">
+                    <i class="bi bi-shield-check"></i>
+                </div>
+                <div class="brand-text">
+                    <span class="brand-name">DataSmith</span>
+                    <span class="brand-tag">Enterprise</span>
+                </div>
+            </a>
+            
+            <div class="nav-links">
+                <a href="#" class="nav-link active" id="navAnalysis" onclick="showView('analysis'); return false;">
+                    <i class="bi bi-graph-up"></i>
+                    <span>Analysis</span>
+                </a>
+                <a href="#" class="nav-link" id="navHistory" onclick="showView('history'); return false;">
+                    <i class="bi bi-clock-history"></i>
+                    <span>History</span>
+                    <span class="nav-badge" id="historyCount">0</span>
+                </a>
+            </div>
+
+            <div id="liveClock" style="font-family: var(--font-mono); font-size: 0.9rem; color: var(--text-secondary);"></div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="main-container">
+        
+        <!-- Analysis View -->
+        <div id="analysisView">
+            
+            <!-- Upload Section -->
+            <div class="upload-section">
+                <div class="card upload-card" id="uploadBox">
+                    <div class="upload-icon">
+                        <i class="bi bi-cloud-arrow-up"></i>
+                    </div>
+                    <h3 class="upload-title">Upload Log Files</h3>
+                    <p class="upload-subtitle">Drop your files here or click to browse • Supports .log and .txt</p>
+                    <input type="file" id="fileInput" accept=".log,.txt" hidden>
+                    <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
+                        <i class="bi bi-folder2-open"></i>
+                        Select File
+                    </button>
+                    <div class="file-name" id="fileName" style="display: none;"></div>
+                </div>
+            </div>
+
+            <!-- Analyze Button -->
+            <div class="text-center mb-4" id="analyzeSection" style="display: none;">
+                <button class="btn btn-primary btn-lg" id="analyzeBtn" onclick="analyzeFile()">
+                    <i class="bi bi-cpu"></i>
+                    Start Analysis
+                </button>
+            </div>
+
+            <!-- Loading State -->
+            <div class="loading-container" id="loading" style="display: none;">
+                <div class="loader"></div>
+                <p class="loading-text">Analyzing your logs...</p>
+                <p class="loading-subtext">This may take a moment for large files</p>
+            </div>
+
+            <!-- Error Message -->
+            <div class="error-alert" id="errorMessage" style="display: none;">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <span id="errorText"></span>
+            </div>
+
+            <!-- Results Section -->
+            <div id="results" style="display: none;">
+                
+                <!-- Metrics Grid -->
+                <div class="metrics-grid">
+                    <div class="card metric-card">
+                        <div class="metric-header">
+                            <div class="metric-icon total">
+                                <i class="bi bi-file-text"></i>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-label">Total Logs</span>
+                                <span class="metric-value" id="totalLogs">0</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="metric-header">
+                            <div class="metric-icon parsed">
+                                <i class="bi bi-check-circle"></i>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-label">Parsed</span>
+                                <span class="metric-value" id="parsedLogs">0</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card metric-card">
+                        <div class="metric-header">
+                            <div class="metric-icon ips">
+                                <i class="bi bi-globe"></i>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-label">Unique IPs</span>
+                                <span class="metric-value" id="uniqueIps">0</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card metric-card threat-card">
+                        <div class="metric-header">
+                            <div class="metric-icon threats">
+                                <i class="bi bi-exclamation-triangle"></i>
+                            </div>
+                            <div class="metric-info">
+                                <span class="metric-label">Threats</span>
+                                <span class="metric-value threat" id="threatsDetected">0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Charts Grid -->
+                <div class="charts-grid">
+                    <div class="card chart-card">
+                        <div class="chart-header">
+                            <h4><i class="bi bi-pie-chart"></i> Attack Distribution</h4>
+                            <span class="chart-badge">Interactive</span>
+                        </div>
+                        <div class="chart-body">
+                            <canvas id="attackChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="card chart-card">
+                        <div class="chart-header">
+                            <h4><i class="bi bi-bar-chart"></i> Top IP Addresses</h4>
+                            <span class="chart-badge">Interactive</span>
+                        </div>
+                        <div class="chart-body">
+                            <canvas id="ipChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="card chart-card">
+                        <div class="chart-header">
+                            <h4><i class="bi bi-diagram-3"></i> HTTP Methods</h4>
+                            <span class="chart-badge">Interactive</span>
+                        </div>
+                        <div class="chart-body">
+                            <canvas id="methodsChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="card chart-card">
+                        <div class="chart-header">
+                            <h4><i class="bi bi-tags"></i> Log Types</h4>
+                            <span class="chart-badge">Interactive</span>
+                        </div>
+                        <div class="chart-body">
+                            <canvas id="logTypesChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Export Actions -->
+                <div class="actions-grid mb-4">
+                    <button class="btn btn-secondary" onclick="exportCSV()">
+                        <i class="bi bi-filetype-csv"></i>
+                        Export CSV
+                    </button>
+                    <button class="btn btn-secondary" onclick="exportJSON()">
+                        <i class="bi bi-filetype-json"></i>
+                        Export JSON
+                    </button>
+                    <button class="btn btn-primary" onclick="generatePDF()">
+                        <i class="bi bi-file-pdf"></i>
+                        Generate Report
+                    </button>
+                </div>
+
+                <!-- Data Tables -->
+                <div class="card table-card">
+                    <div class="table-tabs">
+                        <button class="tab-btn active" data-tab="attackTypes">
+                            <i class="bi bi-shield-exclamation"></i>
+                            Attack Types
+                        </button>
+                        <button class="tab-btn" data-tab="topIps">
+                            <i class="bi bi-hdd-network"></i>
+                            Top IPs
+                        </button>
+                        <button class="tab-btn" data-tab="logData">
+                            <i class="bi bi-list-ul"></i>
+                            Log Entries
+                        </button>
+                    </div>
+                    <div class="table-content">
+                        <div class="tab-pane active" id="attackTypes">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Attack Type</th>
+                                        <th>Count</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="attackTypesBody"></tbody>
+                            </table>
+                        </div>
+                        <div class="tab-pane" id="topIps">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>IP Address</th>
+                                        <th>Requests</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="topIpsBody"></tbody>
+                            </table>
+                        </div>
+                        <div class="tab-pane" id="logData">
+                            <div class="filter-bar" style="margin-bottom: 15px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
+                                <div class="filter-group">
+                                    <label for="classificationFilter" style="font-size: 12px; color: #666; margin-right: 8px;">Classification:</label>
+                                    <select id="classificationFilter" onchange="filterLogData()" style="padding: 8px 12px; border: 1px solid #e0e0e0; border-radius: 6px; font-size: 13px; min-width: 180px; background: white; cursor: pointer;">
+                                        <option value="all">All Classifications</option>
+                                    </select>
+                                </div>
+                                <div class="filter-group">
+                                    <label for="methodFilter" style="font-size: 12px; color: #666; margin-right: 8px;">Method:</label>
+                                    <select id="methodFilter" onchange="filterLogData()" style="padding: 8px 12px; border: 1px solid #e0e0e0; border-radius: 6px; font-size: 13px; min-width: 120px; background: white; cursor: pointer;">
+                                        <option value="all">All Methods</option>
+                                    </select>
+                                </div>
+                                <div class="filter-group">
+                                    <label for="statusFilter" style="font-size: 12px; color: #666; margin-right: 8px;">Status:</label>
+                                    <select id="statusFilter" onchange="filterLogData()" style="padding: 8px 12px; border: 1px solid #e0e0e0; border-radius: 6px; font-size: 13px; min-width: 120px; background: white; cursor: pointer;">
+                                        <option value="all">All Statuses</option>
+                                    </select>
+                                </div>
+                                <button onclick="resetFilters()" style="padding: 8px 16px; background: #f0f0f0; border: 1px solid #e0e0e0; border-radius: 6px; font-size: 13px; cursor: pointer; transition: all 0.2s;">
+                                    <i class="bi bi-x-circle"></i> Reset
+                                </button>
+                                <span id="filteredCount" style="font-size: 12px; color: #888; margin-left: auto;"></span>
+                            </div>
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>IP</th>
+                                        <th>Method</th>
+                                        <th>Endpoint</th>
+                                        <th>Status</th>
+                                        <th>Classification</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="logDataBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- History View -->
+        <div id="historyView" style="display: none;">
+            <div class="history-header">
+                <h2><i class="bi bi-clock-history"></i> Analysis History</h2>
+                <button class="btn btn-secondary" onclick="loadHistory()">
+                    <i class="bi bi-arrow-clockwise"></i>
+                    Refresh
+                </button>
+            </div>
+
+            <div class="loading-container" id="historyLoading" style="display: none;">
+                <div class="loader"></div>
+                <p class="loading-text">Loading history...</p>
+            </div>
+
+            <div class="error-alert" id="historyError" style="display: none;">
+                <i class="bi bi-exclamation-triangle-fill"></i>
+                <span>Failed to load history</span>
+            </div>
+
+            <div class="empty-state" id="historyEmpty" style="display: none;">
+                <div class="empty-icon">
+                    <i class="bi bi-inbox"></i>
+                </div>
+                <h3>No Analysis History</h3>
+                <p>Upload and analyze log files to see them here</p>
+            </div>
+
+            <div class="history-grid" id="historyList"></div>
+        </div>
+    </div>
+
+    <!-- History Detail Modal -->
+    <div class="modal fade" id="historyDetailModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="historyDetailTitle">
+                        <i class="bi bi-file-text"></i> Analysis Details
+                    </h5>
+                    <button type="button" class="modal-close" data-bs-dismiss="modal">
+                        <i class="bi bi-x-lg"></i>
+                    </button>
+                </div>
+                <div class="modal-body" id="historyDetailBody"></div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-danger" id="deleteHistoryBtn">
+                        <i class="bi bi-trash"></i>
+                        Delete
+                    </button>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                        Close
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Custom JS -->
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
